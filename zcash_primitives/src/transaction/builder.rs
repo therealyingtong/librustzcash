@@ -11,10 +11,11 @@ use rand::{rngs::OsRng, seq::SliceRandom, CryptoRng, RngCore};
 
 use crate::{
     consensus,
-    keys::OutgoingViewingKey,
+    jubjub::ToUniform,
+    keys::{prf_expand, OutgoingViewingKey},
     legacy::TransparentAddress,
     merkle_tree::MerklePath,
-    note_encryption::{generate_esk, Memo, SaplingNoteEncryption},
+    note_encryption::{generate_esk_v1, generate_esk_v2, Memo, SaplingNoteEncryption},
     prover::TxProver,
     redjubjub::PrivateKey,
     sapling::{spend_sig, Node},
@@ -48,6 +49,14 @@ pub enum Error {
     SpendProof,
 }
 
+fn is_past_canopy(height: u32) -> bool {
+    height
+        >= <consensus::MainNetwork as consensus::Parameters>::activation_height(
+            consensus::NetworkUpgrade::Canopy,
+        )
+        .unwrap()
+}
+
 struct SpendDescriptionInfo {
     extsk: ExtendedSpendingKey,
     diversifier: Diversifier,
@@ -61,10 +70,12 @@ pub struct SaplingOutput {
     to: PaymentAddress<Bls12>,
     note: Note<Bls12>,
     memo: Memo,
+    rseed: Option<[u8; 32]>,
 }
 
 impl SaplingOutput {
     pub fn new<R: RngCore + CryptoRng>(
+        height: u32,
         rng: &mut R,
         ovk: OutgoingViewingKey,
         to: PaymentAddress<Bls12>,
@@ -79,7 +90,20 @@ impl SaplingOutput {
             return Err(Error::InvalidAmount);
         }
 
-        let rcm = Fs::random(rng);
+        let rcm;
+        let mut rseed = [0u8; 32];
+        if height
+            < <consensus::MainNetwork as consensus::Parameters>::activation_height(
+                consensus::NetworkUpgrade::Canopy,
+            )
+            .unwrap()
+        {
+            rcm = Fs::random(rng);
+        } else {
+            // rseed is a random 32-byte sequence
+            rng.fill_bytes(&mut rseed);
+            rcm = Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes());
+        }
 
         let note = Note {
             g_d,
@@ -93,21 +117,31 @@ impl SaplingOutput {
             to,
             note,
             memo: memo.unwrap_or_default(),
+            rseed: Some(rseed),
         })
     }
 
     pub fn build<P: TxProver, R: RngCore + CryptoRng>(
         self,
+        height: u32,
         prover: &P,
         ctx: &mut P::SaplingProvingContext,
         rng: &mut R,
     ) -> OutputDescription {
+        let esk;
+        if !is_past_canopy(height) {
+            esk = generate_esk_v1(rng);
+        } else {
+            esk = generate_esk_v2(self.rseed.unwrap());
+        }
+
         let encryptor = SaplingNoteEncryption::new(
+            esk,
             self.ovk,
             self.note.clone(),
             self.to.clone(),
             self.memo,
-            rng,
+            Some(self.rseed.unwrap()),
         );
 
         let (zkproof, cv) = prover.output_proof(
@@ -120,7 +154,14 @@ impl SaplingOutput {
 
         let cmu = self.note.cm(&JUBJUB);
 
-        let enc_ciphertext = encryptor.encrypt_note_plaintext();
+        let enc_ciphertext;
+
+        if !is_past_canopy(height) {
+            enc_ciphertext = encryptor.encrypt_note_plaintext_v1();
+        } else {
+            enc_ciphertext = encryptor.encrypt_note_plaintext_v2();
+        }
+
         let out_ciphertext = encryptor.encrypt_outgoing_plaintext(&cv, &cmu);
 
         let ephemeral_key = encryptor.epk().clone().into();
@@ -282,6 +323,7 @@ impl TransactionMetadata {
 /// Generates a [`Transaction`] from its inputs and outputs.
 pub struct Builder<R: RngCore + CryptoRng> {
     rng: R,
+    height: Option<u32>,
     mtx: TransactionData,
     fee: Amount,
     anchor: Option<Fr>,
@@ -322,6 +364,7 @@ impl<R: RngCore + CryptoRng> Builder<R> {
 
         Builder {
             rng,
+            height: Some(height),
             mtx,
             fee: DEFAULT_FEE,
             anchor: None,
@@ -377,7 +420,8 @@ impl<R: RngCore + CryptoRng> Builder<R> {
         value: Amount,
         memo: Option<Memo>,
     ) -> Result<(), Error> {
-        let output = SaplingOutput::new(&mut self.rng, ovk, to, value, memo)?;
+        let output =
+            SaplingOutput::new(self.mtx.expiry_height, &mut self.rng, ovk, to, value, memo)?;
 
         self.mtx.value_balance -= value;
 
@@ -561,8 +605,9 @@ impl<R: RngCore + CryptoRng> Builder<R> {
                 // Record the post-randomized output location
                 tx_metadata.output_indices[pos] = i;
 
-                output.build(prover, &mut ctx, &mut self.rng)
+                output.build(self.mtx.expiry_height, prover, &mut ctx, &mut self.rng)
             } else {
+                let esk;
                 // This is a dummy output
                 let (dummy_to, dummy_note) = {
                     let (diversifier, g_d) = {
@@ -588,18 +633,30 @@ impl<R: RngCore + CryptoRng> Builder<R> {
                         }
                     };
 
+                    let rcm;
+
+                    if !is_past_canopy(self.height.unwrap()) {
+                        rcm = Fs::random(&mut self.rng);
+                        esk = generate_esk_v1(&mut self.rng);
+                    } else {
+                        // rseed is a random 32-byte sequence
+                        let mut rseed = [0u8; 32];
+                        self.rng.fill_bytes(&mut rseed);
+                        rcm = Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes());
+                        esk = generate_esk_v2(rseed);
+                    }
+
                     (
                         payment_address,
                         Note {
                             g_d,
                             pk_d,
-                            r: Fs::random(&mut self.rng),
+                            r: rcm,
                             value: 0,
                         },
                     )
                 };
 
-                let esk = generate_esk(&mut self.rng);
                 let epk = dummy_note.g_d.mul(esk, &JUBJUB);
 
                 let (zkproof, cv) =
@@ -713,6 +770,7 @@ mod tests {
         // Create a builder with 0 fee, so we can construct t outputs
         let mut builder = builder::Builder {
             rng: OsRng,
+            height: None,
             mtx: TransactionData::new(),
             fee: Amount::zero(),
             anchor: None,

@@ -18,7 +18,10 @@ use std::convert::TryInto;
 use std::fmt;
 use std::str;
 
-use crate::{keys::OutgoingViewingKey, JUBJUB};
+use crate::{
+    keys::{prf_expand, OutgoingViewingKey},
+    JUBJUB,
+};
 
 pub const KDF_SAPLING_PERSONALIZATION: &[u8; 16] = b"Zcash_SaplingKDF";
 pub const PRF_OCK_PERSONALIZATION: &[u8; 16] = b"Zcash_Derive_ock";
@@ -32,6 +35,8 @@ const OUT_PLAINTEXT_SIZE: usize = 32 + // pk_d
     32; // esk
 const ENC_CIPHERTEXT_SIZE: usize = NOTE_PLAINTEXT_SIZE + 16;
 const OUT_CIPHERTEXT_SIZE: usize = OUT_PLAINTEXT_SIZE + 16;
+const ZIP212_GRACE_PERIOD: u32 = 32256;
+const CANOPY_ACTIVATION_HEIGHT: u32 = 1103000;
 
 /// Format a byte array as a colon-delimited hex string.
 ///
@@ -133,13 +138,17 @@ impl str::FromStr for Memo {
     }
 }
 
-pub fn generate_esk<R: RngCore + CryptoRng>(rng: &mut R) -> Fs {
+pub fn generate_esk_v1<R: RngCore + CryptoRng>(rng: &mut R) -> Fs {
     // create random 64 byte buffer
     let mut buffer = [0u8; 64];
     rng.fill_bytes(&mut buffer);
 
     // reduce to uniform value
     Fs::to_uniform(&buffer[..])
+}
+
+pub fn generate_esk_v2(rseed: [u8; 32]) -> Fs {
+    Fs::to_uniform(prf_expand(&rseed, &[0x05]).as_bytes())
 }
 
 /// Sapling key agreement for note encryption.
@@ -218,7 +227,7 @@ fn prf_ock(
 /// use zcash_primitives::{
 ///     jubjub::fs::Fs,
 ///     keys::OutgoingViewingKey,
-///     note_encryption::{Memo, SaplingNoteEncryption},
+///     note_encryption::{generate_esk_v1, Memo, SaplingNoteEncryption},
 ///     primitives::{Diversifier, PaymentAddress, ValueCommitment},
 ///     JUBJUB,
 /// };
@@ -238,9 +247,10 @@ fn prf_ock(
 /// };
 /// let note = to.create_note(value, rcv, &JUBJUB).unwrap();
 /// let cmu = note.cm(&JUBJUB);
+/// let esk = generate_esk_v1(&mut rng);
 ///
-/// let enc = SaplingNoteEncryption::new(ovk, note, to, Memo::default(), &mut rng);
-/// let encCiphertext = enc.encrypt_note_plaintext();
+/// let enc = SaplingNoteEncryption::new(esk, ovk, note, to, Memo::default(), None);
+/// let encCiphertext = enc.encrypt_note_plaintext_v1();
 /// let outCiphertext = enc.encrypt_outgoing_plaintext(&cv.cm(&JUBJUB).into(), &cmu);
 /// ```
 pub struct SaplingNoteEncryption {
@@ -250,18 +260,19 @@ pub struct SaplingNoteEncryption {
     to: PaymentAddress<Bls12>,
     memo: Memo,
     ovk: OutgoingViewingKey,
+    rseed: Option<[u8; 32]>,
 }
 
 impl SaplingNoteEncryption {
     /// Creates a new encryption context for the given note.
-    pub fn new<R: RngCore + CryptoRng>(
+    pub fn new(
+        esk: Fs,
         ovk: OutgoingViewingKey,
         note: Note<Bls12>,
         to: PaymentAddress<Bls12>,
         memo: Memo,
-        rng: &mut R,
+        rseed: Option<[u8; 32]>,
     ) -> SaplingNoteEncryption {
-        let esk = generate_esk(rng);
         let epk = note.g_d.mul(esk, &JUBJUB);
 
         SaplingNoteEncryption {
@@ -271,6 +282,7 @@ impl SaplingNoteEncryption {
             to,
             memo,
             ovk,
+            rseed,
         }
     }
 
@@ -284,8 +296,8 @@ impl SaplingNoteEncryption {
         &self.epk
     }
 
-    /// Generates `encCiphertext` for this note.
-    pub fn encrypt_note_plaintext(&self) -> [u8; ENC_CIPHERTEXT_SIZE] {
+    /// Generates `encCiphertext` for v1 note.
+    pub fn encrypt_note_plaintext_v1(&self) -> [u8; ENC_CIPHERTEXT_SIZE] {
         let shared_secret = sapling_ka_agree(&self.esk, self.to.pk_d());
         let key = kdf_sapling(shared_secret, &self.epk);
 
@@ -298,6 +310,33 @@ impl SaplingNoteEncryption {
             .write_u64::<LittleEndian>(self.note.value)
             .unwrap();
         input[20..COMPACT_NOTE_SIZE].copy_from_slice(self.note.r.to_repr().as_ref());
+        input[COMPACT_NOTE_SIZE..NOTE_PLAINTEXT_SIZE].copy_from_slice(&self.memo.0);
+
+        let mut output = [0u8; ENC_CIPHERTEXT_SIZE];
+        assert_eq!(
+            ChachaPolyIetf::aead_cipher()
+                .seal_to(&mut output, &input, &[], &key.as_bytes(), &[0u8; 12])
+                .unwrap(),
+            ENC_CIPHERTEXT_SIZE
+        );
+
+        output
+    }
+
+    /// Generates `encCiphertext` for v2 note.
+    pub fn encrypt_note_plaintext_v2(&self) -> [u8; ENC_CIPHERTEXT_SIZE] {
+        let shared_secret = sapling_ka_agree(&self.esk, self.to.pk_d());
+        let key = kdf_sapling(shared_secret, &self.epk);
+
+        // Note plaintext encoding is defined in section 5.5 of the Zcash Protocol
+        // Specification.
+        let mut input = [0; NOTE_PLAINTEXT_SIZE];
+        input[0] = 2;
+        input[1..12].copy_from_slice(&self.to.diversifier().0);
+        (&mut input[12..20])
+            .write_u64::<LittleEndian>(self.note.value)
+            .unwrap();
+        input[20..COMPACT_NOTE_SIZE].copy_from_slice(&self.rseed.unwrap());
         input[COMPACT_NOTE_SIZE..NOTE_PLAINTEXT_SIZE].copy_from_slice(&self.memo.0);
 
         let mut output = [0u8; ENC_CIPHERTEXT_SIZE];
@@ -335,32 +374,75 @@ impl SaplingNoteEncryption {
     }
 }
 
+fn check_note_plaintext_version(height: u32, lead_byte: u8) -> Option<()> {
+    let is_past_canopy = height >= CANOPY_ACTIVATION_HEIGHT;
+
+    let is_past_zip212_grace_period = height >= ZIP212_GRACE_PERIOD + CANOPY_ACTIVATION_HEIGHT;
+
+    // Check note plaintext version
+    if is_past_zip212_grace_period {
+        match lead_byte {
+            0x02 => Some(()),
+            _ => return None,
+        }
+    } else if is_past_canopy {
+        match lead_byte {
+            0x01 => Some(()),
+            0x02 => Some(()),
+            _ => return None,
+        }
+    } else {
+        match lead_byte {
+            0x01 => Some(()),
+            _ => return None,
+        }
+    }
+}
+
 fn parse_note_plaintext_without_memo(
+    height: u32,
     ivk: &Fs,
+    epk: &edwards::Point<Bls12, PrimeOrder>,
     cmu: &Fr,
     plaintext: &[u8],
 ) -> Option<(Note<Bls12>, PaymentAddress<Bls12>)> {
-    // Check note plaintext version
-    match plaintext[0] {
-        0x01 => (),
-        _ => return None,
-    }
+    if check_note_plaintext_version(height, plaintext[0]).is_none() {
+        return None;
+    };
 
     let mut d = [0u8; 11];
     d.copy_from_slice(&plaintext[1..12]);
 
     let v = (&plaintext[12..20]).read_u64::<LittleEndian>().ok()?;
-
-    let rcm = Fs::from_repr(FsRepr(
-        plaintext[20..COMPACT_NOTE_SIZE]
-            .try_into()
-            .expect("slice is the correct length"),
-    ))?;
-
     let diversifier = Diversifier(d);
     let pk_d = diversifier
         .g_d::<Bls12>(&JUBJUB)?
         .mul(ivk.to_repr(), &JUBJUB);
+
+    let rcm;
+    if plaintext[0] == 0x01 {
+        rcm = Fs::from_repr(FsRepr(
+            plaintext[20..COMPACT_NOTE_SIZE]
+                .try_into()
+                .expect("slice is the correct length"),
+        ))?;
+    } else if plaintext[0] == 0x02 {
+        let mut rseed = [0u8; 32];
+        rseed.copy_from_slice(&plaintext[20..COMPACT_NOTE_SIZE]);
+        rcm = Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes());
+        let esk = Fs::to_uniform(prf_expand(&rseed, &[0x05]).as_bytes());
+
+        if diversifier
+            .g_d::<Bls12>(&JUBJUB)?
+            .mul(esk.to_repr(), &JUBJUB)
+            != *epk
+        {
+            // Published epk doesn't match calculated epk
+            return None;
+        }
+    } else {
+        return None;
+    }
 
     let to = PaymentAddress::from_parts(diversifier, pk_d)?;
     let note = to.create_note(v, rcm, &JUBJUB).unwrap();
@@ -381,6 +463,7 @@ fn parse_note_plaintext_without_memo(
 ///
 /// Implements section 4.17.2 of the Zcash Protocol Specification.
 pub fn try_sapling_note_decryption(
+    height: u32,
     ivk: &Fs,
     epk: &edwards::Point<Bls12, PrimeOrder>,
     cmu: &Fr,
@@ -405,7 +488,7 @@ pub fn try_sapling_note_decryption(
         NOTE_PLAINTEXT_SIZE
     );
 
-    let (note, to) = parse_note_plaintext_without_memo(ivk, cmu, &plaintext)?;
+    let (note, to) = parse_note_plaintext_without_memo(height, ivk, epk, cmu, &plaintext)?;
 
     let mut memo = [0u8; 512];
     memo.copy_from_slice(&plaintext[COMPACT_NOTE_SIZE..NOTE_PLAINTEXT_SIZE]);
@@ -423,6 +506,7 @@ pub fn try_sapling_note_decryption(
 ///
 /// [`ZIP 307`]: https://github.com/zcash/zips/pull/226
 pub fn try_sapling_compact_note_decryption(
+    height: u32,
     ivk: &Fs,
     epk: &edwards::Point<Bls12, PrimeOrder>,
     cmu: &Fr,
@@ -438,7 +522,7 @@ pub fn try_sapling_compact_note_decryption(
     plaintext.copy_from_slice(&enc_ciphertext);
     ChaCha20Ietf::xor(key.as_bytes(), &[0u8; 12], 1, &mut plaintext);
 
-    parse_note_plaintext_without_memo(ivk, cmu, &plaintext)
+    parse_note_plaintext_without_memo(height, ivk, epk, cmu, &plaintext)
 }
 
 /// Recovery of the full note plaintext by the sender.
@@ -449,6 +533,7 @@ pub fn try_sapling_compact_note_decryption(
 ///
 /// Implements section 4.17.3 of the Zcash Protocol Specification.
 pub fn try_sapling_output_recovery(
+    height: u32,
     ovk: &OutgoingViewingKey,
     cv: &edwards::Point<Bls12, Unknown>,
     cmu: &Fr,
@@ -496,10 +581,8 @@ pub fn try_sapling_output_recovery(
         NOTE_PLAINTEXT_SIZE
     );
 
-    // Check note plaintext version
-    match plaintext[0] {
-        0x01 => (),
-        _ => return None,
+    if check_note_plaintext_version(height, plaintext[0]).is_none() {
+        return None;
     }
 
     let mut d = [0u8; 11];
@@ -507,11 +590,22 @@ pub fn try_sapling_output_recovery(
 
     let v = (&plaintext[12..20]).read_u64::<LittleEndian>().ok()?;
 
-    let rcm = Fs::from_repr(FsRepr(
-        plaintext[20..COMPACT_NOTE_SIZE]
-            .try_into()
-            .expect("slice is the correct length"),
-    ))?;
+    let rcm;
+    if plaintext[0] == 0x01 {
+        rcm = Fs::from_repr(FsRepr(
+            plaintext[20..COMPACT_NOTE_SIZE]
+                .try_into()
+                .expect("slice is the correct length"),
+        ))?;
+    } else if plaintext[0] == 0x02 {
+        let mut rseed = [0u8; 32];
+        rseed.copy_from_slice(&plaintext[20..COMPACT_NOTE_SIZE]);
+        rcm = Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes());
+        let derived_esk = Fs::to_uniform(prf_expand(&rseed, &[0x05]).as_bytes());
+        assert_eq!(esk, derived_esk);
+    } else {
+        return None;
+    }
 
     let mut memo = [0u8; 512];
     memo.copy_from_slice(&plaintext[COMPACT_NOTE_SIZE..NOTE_PLAINTEXT_SIZE]);
@@ -543,7 +637,7 @@ mod tests {
         jubjub::{
             edwards,
             fs::{Fs, FsRepr},
-            PrimeOrder, Unknown,
+            PrimeOrder, ToUniform, Unknown,
         },
         primitives::{Diversifier, PaymentAddress, ValueCommitment},
     };
@@ -561,7 +655,11 @@ mod tests {
         COMPACT_NOTE_SIZE, ENC_CIPHERTEXT_SIZE, NOTE_PLAINTEXT_SIZE, OUT_CIPHERTEXT_SIZE,
         OUT_PLAINTEXT_SIZE,
     };
-    use crate::{keys::OutgoingViewingKey, JUBJUB};
+    use crate::{
+        keys::{prf_expand, OutgoingViewingKey},
+        note_encryption::{generate_esk_v1, generate_esk_v2, CANOPY_ACTIVATION_HEIGHT},
+        JUBJUB,
+    };
 
     #[test]
     fn memo_from_str() {
@@ -679,7 +777,7 @@ mod tests {
         assert_eq!(Memo::default().to_utf8(), None);
     }
 
-    fn random_enc_ciphertext<R: RngCore + CryptoRng>(
+    fn random_enc_ciphertext_v1<R: RngCore + CryptoRng>(
         mut rng: &mut R,
     ) -> (
         OutgoingViewingKey,
@@ -690,13 +788,15 @@ mod tests {
         [u8; ENC_CIPHERTEXT_SIZE],
         [u8; OUT_CIPHERTEXT_SIZE],
     ) {
+        let height = 0;
         let ivk = Fs::random(&mut rng);
 
         let (ovk, ivk, cv, cmu, epk, enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext_with(ivk, rng);
+            random_enc_ciphertext_with_v1(ivk, rng);
 
-        assert!(try_sapling_note_decryption(&ivk, &epk, &cmu, &enc_ciphertext).is_some());
+        assert!(try_sapling_note_decryption(height, &ivk, &epk, &cmu, &enc_ciphertext).is_some());
         assert!(try_sapling_compact_note_decryption(
+            height,
             &ivk,
             &epk,
             &cmu,
@@ -704,6 +804,7 @@ mod tests {
         )
         .is_some());
         assert!(try_sapling_output_recovery(
+            height,
             &ovk,
             &cv,
             &cmu,
@@ -716,7 +817,7 @@ mod tests {
         (ovk, ivk, cv, cmu, epk, enc_ciphertext, out_ciphertext)
     }
 
-    fn random_enc_ciphertext_with<R: RngCore + CryptoRng>(
+    fn random_enc_ciphertext_with_v1<R: RngCore + CryptoRng>(
         ivk: Fs,
         mut rng: &mut R,
     ) -> (
@@ -734,21 +835,111 @@ mod tests {
 
         // Construct the value commitment for the proof instance
         let value = 100;
+        let rcm = Fs::random(&mut rng);
         let value_commitment = ValueCommitment::<Bls12> {
             value,
-            randomness: Fs::random(&mut rng),
+            randomness: rcm,
         };
         let cv = value_commitment.cm(&JUBJUB).into();
 
-        let note = pa
-            .create_note(value, Fs::random(&mut rng), &JUBJUB)
-            .unwrap();
+        let note = pa.create_note(value, rcm, &JUBJUB).unwrap();
         let cmu = note.cm(&JUBJUB);
 
         let ovk = OutgoingViewingKey([0; 32]);
-        let ne = SaplingNoteEncryption::new(ovk, note, pa, Memo([0; 512]), rng);
+        let esk = generate_esk_v1(rng);
+        let ne = SaplingNoteEncryption::new(esk, ovk, note, pa, Memo([0; 512]), None);
         let epk = ne.epk();
-        let enc_ciphertext = ne.encrypt_note_plaintext();
+        let enc_ciphertext = ne.encrypt_note_plaintext_v1();
+        let out_ciphertext = ne.encrypt_outgoing_plaintext(&cv, &cmu);
+
+        (
+            ovk,
+            ivk,
+            cv,
+            cmu,
+            epk.clone(),
+            enc_ciphertext,
+            out_ciphertext,
+        )
+    }
+
+    fn random_enc_ciphertext_v2<R: RngCore + CryptoRng>(
+        mut rng: &mut R,
+    ) -> (
+        OutgoingViewingKey,
+        Fs,
+        edwards::Point<Bls12, Unknown>,
+        Fr,
+        edwards::Point<Bls12, PrimeOrder>,
+        [u8; ENC_CIPHERTEXT_SIZE],
+        [u8; OUT_CIPHERTEXT_SIZE],
+    ) {
+        let ivk = Fs::random(&mut rng);
+        let height = CANOPY_ACTIVATION_HEIGHT;
+
+        let (ovk, ivk, cv, cmu, epk, enc_ciphertext, out_ciphertext) =
+            random_enc_ciphertext_with_v2(ivk, rng);
+
+        assert!(try_sapling_note_decryption(height, &ivk, &epk, &cmu, &enc_ciphertext).is_some());
+        assert!(try_sapling_compact_note_decryption(
+            height,
+            &ivk,
+            &epk,
+            &cmu,
+            &enc_ciphertext[..COMPACT_NOTE_SIZE]
+        )
+        .is_some());
+        assert!(try_sapling_output_recovery(
+            height,
+            &ovk,
+            &cv,
+            &cmu,
+            &epk,
+            &enc_ciphertext,
+            &out_ciphertext
+        )
+        .is_some());
+
+        (ovk, ivk, cv, cmu, epk, enc_ciphertext, out_ciphertext)
+    }
+
+    fn random_enc_ciphertext_with_v2<R: RngCore + CryptoRng>(
+        ivk: Fs,
+        rng: &mut R,
+    ) -> (
+        OutgoingViewingKey,
+        Fs,
+        edwards::Point<Bls12, Unknown>,
+        Fr,
+        edwards::Point<Bls12, PrimeOrder>,
+        [u8; ENC_CIPHERTEXT_SIZE],
+        [u8; OUT_CIPHERTEXT_SIZE],
+    ) {
+        let diversifier = Diversifier([0; 11]);
+        let pk_d = diversifier.g_d::<Bls12>(&JUBJUB).unwrap().mul(ivk, &JUBJUB);
+        let pa = PaymentAddress::from_parts_unchecked(diversifier, pk_d);
+
+        // Construct the value commitment for the proof instance
+        let value = 100;
+        let mut rseed = [0u8; 32];
+        rng.fill_bytes(&mut rseed);
+
+        let rcm = Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes());
+        let esk = Fs::to_uniform(prf_expand(&rseed, &[0x05]).as_bytes());
+
+        let value_commitment = ValueCommitment::<Bls12> {
+            value,
+            randomness: rcm,
+        };
+        let cv = value_commitment.cm(&JUBJUB).into();
+
+        let note = pa.create_note(value, rcm, &JUBJUB).unwrap();
+        let cmu = note.cm(&JUBJUB);
+
+        let ovk = OutgoingViewingKey([0; 32]);
+        let ne = SaplingNoteEncryption::new(esk, ovk, note, pa, Memo([0; 512]), Some(rseed));
+        let epk = ne.epk();
+        let enc_ciphertext = ne.encrypt_note_plaintext_v2();
         let out_ciphertext = ne.encrypt_outgoing_plaintext(&cv, &cmu);
 
         (
@@ -849,25 +1040,28 @@ mod tests {
     }
 
     #[test]
-    fn decryption_with_invalid_ivk() {
+    fn decryption_with_invalid_ivk_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (_, _, _, cmu, epk, enc_ciphertext, _) = random_enc_ciphertext(&mut rng);
+        let (_, _, _, cmu, epk, enc_ciphertext, _) = random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
-            try_sapling_note_decryption(&Fs::random(&mut rng), &epk, &cmu, &enc_ciphertext),
+            try_sapling_note_decryption(height, &Fs::random(&mut rng), &epk, &cmu, &enc_ciphertext),
             None
         );
     }
 
     #[test]
-    fn decryption_with_invalid_epk() {
+    fn decryption_with_invalid_epk_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (_, ivk, _, cmu, _, enc_ciphertext, _) = random_enc_ciphertext(&mut rng);
+        let (_, ivk, _, cmu, _, enc_ciphertext, _) = random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
             try_sapling_note_decryption(
+                height,
                 &ivk,
                 &edwards::Point::<Bls12, _>::rand(&mut rng, &JUBJUB).mul_by_cofactor(&JUBJUB),
                 &cmu,
@@ -878,36 +1072,39 @@ mod tests {
     }
 
     #[test]
-    fn decryption_with_invalid_cmu() {
+    fn decryption_with_invalid_cmu_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (_, ivk, _, _, epk, enc_ciphertext, _) = random_enc_ciphertext(&mut rng);
+        let (_, ivk, _, _, epk, enc_ciphertext, _) = random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
-            try_sapling_note_decryption(&ivk, &epk, &Fr::random(&mut rng), &enc_ciphertext),
+            try_sapling_note_decryption(height, &ivk, &epk, &Fr::random(&mut rng), &enc_ciphertext),
             None
         );
     }
 
     #[test]
-    fn decryption_with_invalid_tag() {
+    fn decryption_with_invalid_tag_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (_, ivk, _, cmu, epk, mut enc_ciphertext, _) = random_enc_ciphertext(&mut rng);
+        let (_, ivk, _, cmu, epk, mut enc_ciphertext, _) = random_enc_ciphertext_v1(&mut rng);
 
         enc_ciphertext[ENC_CIPHERTEXT_SIZE - 1] ^= 0xff;
         assert_eq!(
-            try_sapling_note_decryption(&ivk, &epk, &cmu, &enc_ciphertext),
+            try_sapling_note_decryption(height, &ivk, &epk, &cmu, &enc_ciphertext),
             None
         );
     }
 
     #[test]
-    fn decryption_with_invalid_version_byte() {
+    fn decryption_with_invalid_version_byte_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, ivk, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -919,17 +1116,41 @@ mod tests {
             |pt| pt[0] = 0x02,
         );
         assert_eq!(
-            try_sapling_note_decryption(&ivk, &epk, &cmu, &enc_ciphertext),
+            try_sapling_note_decryption(height, &ivk, &epk, &cmu, &enc_ciphertext),
             None
         );
     }
 
     #[test]
-    fn decryption_with_invalid_diversifier() {
+    fn decryption_with_invalid_version_byte_v2() {
         let mut rng = OsRng;
+        let height = CANOPY_ACTIVATION_HEIGHT;
 
         let (ovk, ivk, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v2(&mut rng);
+
+        reencrypt_enc_ciphertext(
+            &ovk,
+            &cv,
+            &cmu,
+            &epk,
+            &mut enc_ciphertext,
+            &out_ciphertext,
+            |pt| pt[0] = 0x03,
+        );
+        assert_eq!(
+            try_sapling_note_decryption(height, &ivk, &epk, &cmu, &enc_ciphertext),
+            None
+        );
+    }
+
+    #[test]
+    fn decryption_with_invalid_diversifier_v1() {
+        let mut rng = OsRng;
+        let height = 0;
+
+        let (ovk, ivk, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -941,17 +1162,18 @@ mod tests {
             |pt| pt[1..12].copy_from_slice(&find_invalid_diversifier().0),
         );
         assert_eq!(
-            try_sapling_note_decryption(&ivk, &epk, &cmu, &enc_ciphertext),
+            try_sapling_note_decryption(height, &ivk, &epk, &cmu, &enc_ciphertext),
             None
         );
     }
 
     #[test]
-    fn decryption_with_incorrect_diversifier() {
+    fn decryption_with_incorrect_diversifier_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, ivk, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -963,19 +1185,21 @@ mod tests {
             |pt| pt[1..12].copy_from_slice(&find_valid_diversifier().0),
         );
         assert_eq!(
-            try_sapling_note_decryption(&ivk, &epk, &cmu, &enc_ciphertext),
+            try_sapling_note_decryption(height, &ivk, &epk, &cmu, &enc_ciphertext),
             None
         );
     }
 
     #[test]
-    fn compact_decryption_with_invalid_ivk() {
+    fn compact_decryption_with_invalid_ivk_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (_, _, _, cmu, epk, enc_ciphertext, _) = random_enc_ciphertext(&mut rng);
+        let (_, _, _, cmu, epk, enc_ciphertext, _) = random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
             try_sapling_compact_note_decryption(
+                height,
                 &Fs::random(&mut rng),
                 &epk,
                 &cmu,
@@ -986,13 +1210,15 @@ mod tests {
     }
 
     #[test]
-    fn compact_decryption_with_invalid_epk() {
+    fn compact_decryption_with_invalid_epk_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (_, ivk, _, cmu, _, enc_ciphertext, _) = random_enc_ciphertext(&mut rng);
+        let (_, ivk, _, cmu, _, enc_ciphertext, _) = random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
             try_sapling_compact_note_decryption(
+                height,
                 &ivk,
                 &edwards::Point::<Bls12, _>::rand(&mut rng, &JUBJUB).mul_by_cofactor(&JUBJUB),
                 &cmu,
@@ -1003,13 +1229,15 @@ mod tests {
     }
 
     #[test]
-    fn compact_decryption_with_invalid_cmu() {
+    fn compact_decryption_with_invalid_cmu_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (_, ivk, _, _, epk, enc_ciphertext, _) = random_enc_ciphertext(&mut rng);
+        let (_, ivk, _, _, epk, enc_ciphertext, _) = random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
             try_sapling_compact_note_decryption(
+                height,
                 &ivk,
                 &epk,
                 &Fr::random(&mut rng),
@@ -1020,11 +1248,12 @@ mod tests {
     }
 
     #[test]
-    fn compact_decryption_with_invalid_version_byte() {
+    fn compact_decryption_with_invalid_version_byte_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, ivk, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -1033,10 +1262,11 @@ mod tests {
             &epk,
             &mut enc_ciphertext,
             &out_ciphertext,
-            |pt| pt[0] = 0x02,
+            |pt| pt[0] = 0x03,
         );
         assert_eq!(
             try_sapling_compact_note_decryption(
+                height,
                 &ivk,
                 &epk,
                 &cmu,
@@ -1047,11 +1277,12 @@ mod tests {
     }
 
     #[test]
-    fn compact_decryption_with_invalid_diversifier() {
+    fn compact_decryption_with_invalid_diversifier_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, ivk, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -1064,6 +1295,7 @@ mod tests {
         );
         assert_eq!(
             try_sapling_compact_note_decryption(
+                height,
                 &ivk,
                 &epk,
                 &cmu,
@@ -1074,11 +1306,12 @@ mod tests {
     }
 
     #[test]
-    fn compact_decryption_with_incorrect_diversifier() {
+    fn compact_decryption_with_incorrect_diversifier_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, ivk, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -1091,6 +1324,7 @@ mod tests {
         );
         assert_eq!(
             try_sapling_compact_note_decryption(
+                height,
                 &ivk,
                 &epk,
                 &cmu,
@@ -1101,27 +1335,39 @@ mod tests {
     }
 
     #[test]
-    fn recovery_with_invalid_ovk() {
+    fn recovery_with_invalid_ovk_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (mut ovk, _, cv, cmu, epk, enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         ovk.0[0] ^= 0xff;
         assert_eq!(
-            try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &enc_ciphertext, &out_ciphertext),
+            try_sapling_output_recovery(
+                height,
+                &ovk,
+                &cv,
+                &cmu,
+                &epk,
+                &enc_ciphertext,
+                &out_ciphertext
+            ),
             None
         );
     }
 
     #[test]
-    fn recovery_with_invalid_cv() {
+    fn recovery_with_invalid_cv_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (ovk, _, _, cmu, epk, enc_ciphertext, out_ciphertext) = random_enc_ciphertext(&mut rng);
+        let (ovk, _, _, cmu, epk, enc_ciphertext, out_ciphertext) =
+            random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
             try_sapling_output_recovery(
+                height,
                 &ovk,
                 &edwards::Point::<Bls12, _>::rand(&mut rng, &JUBJUB),
                 &cmu,
@@ -1134,13 +1380,16 @@ mod tests {
     }
 
     #[test]
-    fn recovery_with_invalid_cmu() {
+    fn recovery_with_invalid_cmu_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (ovk, _, cv, _, epk, enc_ciphertext, out_ciphertext) = random_enc_ciphertext(&mut rng);
+        let (ovk, _, cv, _, epk, enc_ciphertext, out_ciphertext) =
+            random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
             try_sapling_output_recovery(
+                height,
                 &ovk,
                 &cv,
                 &Fr::random(&mut rng),
@@ -1153,13 +1402,16 @@ mod tests {
     }
 
     #[test]
-    fn recovery_with_invalid_epk() {
+    fn recovery_with_invalid_epk_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
-        let (ovk, _, cv, cmu, _, enc_ciphertext, out_ciphertext) = random_enc_ciphertext(&mut rng);
+        let (ovk, _, cv, cmu, _, enc_ciphertext, out_ciphertext) =
+            random_enc_ciphertext_v1(&mut rng);
 
         assert_eq!(
             try_sapling_output_recovery(
+                height,
                 &ovk,
                 &cv,
                 &cmu,
@@ -1172,39 +1424,58 @@ mod tests {
     }
 
     #[test]
-    fn recovery_with_invalid_enc_tag() {
+    fn recovery_with_invalid_enc_tag_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, _, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         enc_ciphertext[ENC_CIPHERTEXT_SIZE - 1] ^= 0xff;
         assert_eq!(
-            try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &enc_ciphertext, &out_ciphertext),
+            try_sapling_output_recovery(
+                height,
+                &ovk,
+                &cv,
+                &cmu,
+                &epk,
+                &enc_ciphertext,
+                &out_ciphertext
+            ),
             None
         );
     }
 
     #[test]
-    fn recovery_with_invalid_out_tag() {
+    fn recovery_with_invalid_out_tag_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, _, cv, cmu, epk, enc_ciphertext, mut out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         out_ciphertext[OUT_CIPHERTEXT_SIZE - 1] ^= 0xff;
         assert_eq!(
-            try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &enc_ciphertext, &out_ciphertext),
+            try_sapling_output_recovery(
+                height,
+                &ovk,
+                &cv,
+                &cmu,
+                &epk,
+                &enc_ciphertext,
+                &out_ciphertext
+            ),
             None
         );
     }
 
     #[test]
-    fn recovery_with_invalid_version_byte() {
+    fn recovery_with_invalid_version_byte_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, _, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -1216,17 +1487,26 @@ mod tests {
             |pt| pt[0] = 0x02,
         );
         assert_eq!(
-            try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &enc_ciphertext, &out_ciphertext),
+            try_sapling_output_recovery(
+                height,
+                &ovk,
+                &cv,
+                &cmu,
+                &epk,
+                &enc_ciphertext,
+                &out_ciphertext
+            ),
             None
         );
     }
 
     #[test]
-    fn recovery_with_invalid_diversifier() {
+    fn recovery_with_invalid_diversifier_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, _, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -1238,17 +1518,26 @@ mod tests {
             |pt| pt[1..12].copy_from_slice(&find_invalid_diversifier().0),
         );
         assert_eq!(
-            try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &enc_ciphertext, &out_ciphertext),
+            try_sapling_output_recovery(
+                height,
+                &ovk,
+                &cv,
+                &cmu,
+                &epk,
+                &enc_ciphertext,
+                &out_ciphertext
+            ),
             None
         );
     }
 
     #[test]
-    fn recovery_with_incorrect_diversifier() {
+    fn recovery_with_incorrect_diversifier_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let (ovk, _, cv, cmu, epk, mut enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext(&mut rng);
+            random_enc_ciphertext_v1(&mut rng);
 
         reencrypt_enc_ciphertext(
             &ovk,
@@ -1260,21 +1549,38 @@ mod tests {
             |pt| pt[1..12].copy_from_slice(&find_valid_diversifier().0),
         );
         assert_eq!(
-            try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &enc_ciphertext, &out_ciphertext),
+            try_sapling_output_recovery(
+                height,
+                &ovk,
+                &cv,
+                &cmu,
+                &epk,
+                &enc_ciphertext,
+                &out_ciphertext
+            ),
             None
         );
     }
 
     #[test]
-    fn recovery_with_invalid_pk_d() {
+    fn recovery_with_invalid_pk_d_v1() {
         let mut rng = OsRng;
+        let height = 0;
 
         let ivk = Fs::zero();
         let (ovk, _, cv, cmu, epk, enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext_with(ivk, &mut rng);
+            random_enc_ciphertext_with_v1(ivk, &mut rng);
 
         assert_eq!(
-            try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &enc_ciphertext, &out_ciphertext),
+            try_sapling_output_recovery(
+                height,
+                &ovk,
+                &cv,
+                &cmu,
+                &epk,
+                &enc_ciphertext,
+                &out_ciphertext
+            ),
             None
         );
     }
@@ -1345,7 +1651,8 @@ mod tests {
             // (Tested first because it only requires immutable references.)
             //
 
-            match try_sapling_note_decryption(&ivk, &epk, &cmu, &tv.c_enc) {
+            let height = 0;
+            match try_sapling_note_decryption(height, &ivk, &epk, &cmu, &tv.c_enc) {
                 Some((decrypted_note, decrypted_to, decrypted_memo)) => {
                     assert_eq!(decrypted_note, note);
                     assert_eq!(decrypted_to, to);
@@ -1355,6 +1662,7 @@ mod tests {
             }
 
             match try_sapling_compact_note_decryption(
+                height,
                 &ivk,
                 &epk,
                 &cmu,
@@ -1367,7 +1675,7 @@ mod tests {
                 None => panic!("Compact note decryption failed"),
             }
 
-            match try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &tv.c_enc, &tv.c_out) {
+            match try_sapling_output_recovery(height, &ovk, &cv, &cmu, &epk, &tv.c_enc, &tv.c_out) {
                 Some((decrypted_note, decrypted_to, decrypted_memo)) => {
                     assert_eq!(decrypted_note, note);
                     assert_eq!(decrypted_to, to);
@@ -1380,12 +1688,14 @@ mod tests {
             // Test encryption
             //
 
-            let mut ne = SaplingNoteEncryption::new(ovk, note, to, Memo(tv.memo), &mut OsRng);
+            let ne_esk = generate_esk_v1(&mut OsRng);
+
+            let mut ne = SaplingNoteEncryption::new(ne_esk, ovk, note, to, Memo(tv.memo), None);
             // Swap in the ephemeral keypair from the test vectors
             ne.esk = esk;
             ne.epk = epk;
 
-            assert_eq!(&ne.encrypt_note_plaintext()[..], &tv.c_enc[..]);
+            assert_eq!(&ne.encrypt_note_plaintext_v1()[..], &tv.c_enc[..]);
             assert_eq!(&ne.encrypt_outgoing_plaintext(&cv, &cmu)[..], &tv.c_out[..]);
         }
     }

@@ -23,6 +23,7 @@ use crate::wallet::{WalletShieldedOutput, WalletShieldedSpend, WalletTx};
 /// The given [`CommitmentTree`] and existing [`IncrementalWitness`]es are incremented
 /// with this output's commitment.
 fn scan_output(
+    height: u32,
     (index, output): (usize, CompactOutput),
     ivks: &[Fs],
     spent_from_accounts: &HashSet<usize>,
@@ -49,7 +50,7 @@ fn scan_output(
     tree.append(node).unwrap();
 
     for (account, ivk) in ivks.iter().enumerate() {
-        let (note, to) = match try_sapling_compact_note_decryption(ivk, &epk, &cmu, &ct) {
+        let (note, to) = match try_sapling_compact_note_decryption(height, ivk, &epk, &cmu, &ct) {
             Some(ret) => ret,
             None => continue,
         };
@@ -151,6 +152,7 @@ pub fn scan_block(
                     .collect();
 
                 if let Some(output) = scan_output(
+                    block.height as u32,
                     to_scan,
                     &ivks,
                     &spent_from_accounts,
@@ -189,7 +191,7 @@ mod tests {
     use zcash_primitives::{
         jubjub::{fs::Fs, FixedGenerators, JubjubParams, ToUniform},
         merkle_tree::CommitmentTree,
-        note_encryption::{Memo, SaplingNoteEncryption},
+        note_encryption::{generate_esk_v1, generate_esk_v2, Memo, SaplingNoteEncryption},
         primitives::Note,
         transaction::components::Amount,
         zip32::{ExtendedFullViewingKey, ExtendedSpendingKey},
@@ -249,6 +251,7 @@ mod tests {
 
         // Create a fake Note for the account
         let mut rng = OsRng;
+        let esk = generate_esk_v1(&mut rng);
         let note = Note {
             g_d: to.diversifier().g_d::<Bls12>(&JUBJUB).unwrap(),
             pk_d: to.pk_d().clone(),
@@ -256,16 +259,17 @@ mod tests {
             r: Fs::random(&mut rng),
         };
         let encryptor = SaplingNoteEncryption::new(
+            esk,
             extfvk.fvk.ovk,
             note.clone(),
             to.clone(),
             Memo::default(),
-            &mut rng,
+            None,
         );
         let cmu = note.cm(&JUBJUB).to_repr().as_ref().to_owned();
         let mut epk = vec![];
         encryptor.epk().write(&mut epk).unwrap();
-        let enc_ciphertext = encryptor.encrypt_note_plaintext();
+        let enc_ciphertext = encryptor.encrypt_note_plaintext_v1();
 
         // Create a fake CompactBlock containing the note
         let mut cb = CompactBlock::new();
