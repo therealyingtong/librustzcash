@@ -11,6 +11,7 @@ use rand::{rngs::OsRng, seq::SliceRandom, CryptoRng, RngCore};
 
 use crate::{
     consensus,
+    consensus::NetworkUpgrade,
     jubjub::ToUniform,
     keys::{prf_expand, OutgoingViewingKey},
     legacy::TransparentAddress,
@@ -23,6 +24,7 @@ use crate::{
         components::{amount::DEFAULT_FEE, Amount, OutputDescription, SpendDescription, TxOut},
         signature_hash_data, Transaction, TransactionData, SIGHASH_ALL,
     },
+    util::exists,
     JUBJUB,
 };
 
@@ -49,14 +51,6 @@ pub enum Error {
     SpendProof,
 }
 
-fn is_past_canopy(height: u32) -> bool {
-    height
-        >= <consensus::MainNetwork as consensus::Parameters>::activation_height(
-            consensus::NetworkUpgrade::Canopy,
-        )
-        .unwrap()
-}
-
 struct SpendDescriptionInfo {
     extsk: ExtendedSpendingKey,
     diversifier: Diversifier,
@@ -74,7 +68,8 @@ pub struct SaplingOutput {
 }
 
 impl SaplingOutput {
-    pub fn new<R: RngCore + CryptoRng>(
+    pub fn new<R: RngCore + CryptoRng, P: consensus::Parameters>(
+        parameters: P,
         height: u32,
         rng: &mut R,
         ovk: OutgoingViewingKey,
@@ -90,20 +85,14 @@ impl SaplingOutput {
             return Err(Error::InvalidAmount);
         }
 
-        let rcm;
-        let mut rseed = [0u8; 32];
-        if height
-            < <consensus::MainNetwork as consensus::Parameters>::activation_height(
-                consensus::NetworkUpgrade::Canopy,
-            )
-            .unwrap()
-        {
-            rcm = Fs::random(rng);
-        } else {
+        let (rcm, rseed) = if parameters.is_nu_active(NetworkUpgrade::Canopy, height) {
+            let mut rseed_bytes = [0u8; 32];
             // rseed is a random 32-byte sequence
-            rng.fill_bytes(&mut rseed);
-            rcm = Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes());
-        }
+            rng.fill_bytes(&mut rseed_bytes);
+            (Fs::to_uniform(prf_expand(&rseed_bytes, &[0x04]).as_bytes()), Some(rseed_bytes))
+        } else {
+            (Fs::random(rng), None)
+        };
 
         let note = Note {
             g_d,
@@ -117,23 +106,22 @@ impl SaplingOutput {
             to,
             note,
             memo: memo.unwrap_or_default(),
-            rseed: Some(rseed),
+            rseed,
         })
     }
 
-    pub fn build<P: TxProver, R: RngCore + CryptoRng>(
+    pub fn build<P: TxProver, R: RngCore + CryptoRng, PS: consensus::Parameters>(
         self,
+        parameters: &PS,
         height: u32,
         prover: &P,
         ctx: &mut P::SaplingProvingContext,
         rng: &mut R,
     ) -> OutputDescription {
-        let esk;
-        if !is_past_canopy(height) {
-            esk = generate_esk_v1(rng);
-        } else {
-            esk = generate_esk_v2(self.rseed.unwrap());
-        }
+        let esk = match self.rseed {
+            Some(seed) => generate_esk_v2(seed),
+            None => generate_esk_v1(rng),
+        };
 
         let encryptor = SaplingNoteEncryption::new(
             esk,
@@ -154,13 +142,11 @@ impl SaplingOutput {
 
         let cmu = self.note.cm(&JUBJUB);
 
-        let enc_ciphertext;
-
-        if !is_past_canopy(height) {
-            enc_ciphertext = encryptor.encrypt_note_plaintext_v1();
+        let enc_ciphertext = if !parameters.is_nu_active(NetworkUpgrade::Canopy, height) {
+            encryptor.encrypt_note_plaintext_v1()
         } else {
-            enc_ciphertext = encryptor.encrypt_note_plaintext_v2();
-        }
+            encryptor.encrypt_note_plaintext_v2()
+        };
 
         let out_ciphertext = encryptor.encrypt_outgoing_plaintext(&cv, &cmu);
 
@@ -323,7 +309,7 @@ impl TransactionMetadata {
 /// Generates a [`Transaction`] from its inputs and outputs.
 pub struct Builder<R: RngCore + CryptoRng> {
     rng: R,
-    height: Option<u32>,
+    height: u32,
     mtx: TransactionData,
     fee: Amount,
     anchor: Option<Fr>,
@@ -364,7 +350,7 @@ impl<R: RngCore + CryptoRng> Builder<R> {
 
         Builder {
             rng,
-            height: Some(height),
+            height,
             mtx,
             fee: DEFAULT_FEE,
             anchor: None,
@@ -421,7 +407,7 @@ impl<R: RngCore + CryptoRng> Builder<R> {
         memo: Option<Memo>,
     ) -> Result<(), Error> {
         let output =
-            SaplingOutput::new(self.mtx.expiry_height, &mut self.rng, ovk, to, value, memo)?;
+            SaplingOutput::new(self.height, &mut self.rng, ovk, to, value, memo)?;
 
         self.mtx.value_balance -= value;
 
@@ -635,7 +621,7 @@ impl<R: RngCore + CryptoRng> Builder<R> {
 
                     let rcm;
 
-                    if !is_past_canopy(self.height.unwrap()) {
+                    if !is_past_canopy(self.height) {
                         rcm = Fs::random(&mut self.rng);
                         esk = generate_esk_v1(&mut self.rng);
                     } else {
