@@ -133,7 +133,7 @@ impl SaplingOutput {
             self.note.clone(),
             self.to.clone(),
             self.memo,
-            rng,
+            generate_esk(rng),
         );
 
         let (zkproof, cv) = prover.output_proof(

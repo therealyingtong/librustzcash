@@ -256,14 +256,13 @@ pub struct SaplingNoteEncryption {
 
 impl SaplingNoteEncryption {
     /// Creates a new encryption context for the given note.
-    pub fn new<R: RngCore + CryptoRng>(
+    pub fn new(
         ovk: OutgoingViewingKey,
         note: Note<Bls12>,
         to: PaymentAddress<Bls12>,
         memo: Memo,
-        rng: &mut R,
+        esk: Fs,
     ) -> SaplingNoteEncryption {
-        let esk = generate_esk(rng);
         let epk = note.g_d.mul(esk, &JUBJUB);
 
         SaplingNoteEncryption {
