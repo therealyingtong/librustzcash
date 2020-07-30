@@ -13,7 +13,7 @@ use zcash_primitives::{
     keys::OutgoingViewingKey,
     merkle_tree::{IncrementalWitness, MerklePath},
     note_encryption::Memo,
-    primitives::{Diversifier, Note},
+    primitives::{Diversifier, Note, Zip212Enabled},
     prover::TxProver,
     sapling::Node,
     transaction::{
@@ -249,7 +249,7 @@ pub fn create_to_address<P: AsRef<Path>>(
                 .vk
                 .to_payment_address(diversifier, &JUBJUB)
                 .unwrap();
-            let note = from.create_note(note_value as u64, rcm, &JUBJUB).unwrap();
+            let note = from.create_note(note_value as u64, rcm, &JUBJUB, Zip212Enabled::BeforeZip212).unwrap();
 
             let merkle_path = {
                 let d: Vec<_> = row.get(3)?;

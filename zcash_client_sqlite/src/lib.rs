@@ -102,7 +102,7 @@ mod tests {
         block::BlockHash,
         jubjub::fs::Fs,
         note_encryption::{Memo, SaplingNoteEncryption},
-        primitives::{Note, PaymentAddress},
+        primitives::{Note, PaymentAddress, Zip212Enabled},
         transaction::components::Amount,
         zip32::ExtendedFullViewingKey,
         JUBJUB,
@@ -125,6 +125,7 @@ mod tests {
             pk_d: to.pk_d().clone(),
             value: value.into(),
             r: Fs::random(&mut rng),
+            zip_212_enabled: Zip212Enabled::BeforeZip212,
         };
         let encryptor = SaplingNoteEncryption::new(
             extfvk.fvk.ovk,
@@ -185,6 +186,7 @@ mod tests {
                 pk_d: to.pk_d().clone(),
                 value: value.into(),
                 r: Fs::random(&mut rng),
+                zip_212_enabled: Zip212Enabled::BeforeZip212,
             };
             let encryptor = SaplingNoteEncryption::new(
                 extfvk.fvk.ovk,
@@ -213,6 +215,7 @@ mod tests {
                 pk_d: change_addr.pk_d().clone(),
                 value: (in_value - value).into(),
                 r: Fs::random(&mut rng),
+                zip_212_enabled: Zip212Enabled::BeforeZip212,
             };
             let encryptor = SaplingNoteEncryption::new(
                 extfvk.fvk.ovk,

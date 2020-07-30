@@ -209,14 +209,22 @@ impl<E: JubjubEngine> PaymentAddress<E> {
         value: u64,
         randomness: E::Fs,
         params: &E::Params,
+        zip_212_enabled: Zip212Enabled
     ) -> Option<Note<E>> {
         self.g_d(params).map(|g_d| Note {
             value,
             r: randomness,
             g_d,
             pk_d: self.pk_d.clone(),
+            zip_212_enabled
         })
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum Zip212Enabled {
+    BeforeZip212,
+    AfterZip212,
 }
 
 #[derive(Clone, Debug)]
@@ -229,6 +237,8 @@ pub struct Note<E: JubjubEngine> {
     pub pk_d: edwards::Point<E, PrimeOrder>,
     /// The commitment randomness
     pub r: E::Fs,
+    /// Whether ZIP212 is enabled
+    pub zip_212_enabled: Zip212Enabled,
 }
 
 impl<E: JubjubEngine> PartialEq for Note<E> {

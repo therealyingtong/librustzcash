@@ -6,7 +6,7 @@ use crate::{
         fs::{Fs, FsRepr},
         PrimeOrder, ToUniform, Unknown,
     },
-    primitives::{Diversifier, Note, PaymentAddress},
+    primitives::{Diversifier, Note, PaymentAddress, Zip212Enabled},
 };
 use blake2b_simd::{Hash as Blake2bHash, Params as Blake2bParams};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -236,7 +236,7 @@ fn prf_ock(
 ///     value,
 ///     randomness: rcv.clone(),
 /// };
-/// let note = to.create_note(value, rcv, &JUBJUB).unwrap();
+/// let note = to.create_note(value, rcv, &JUBJUB, Zip212Enabled::BeforeZip212).unwrap();
 /// let cmu = note.cm(&JUBJUB);
 ///
 /// let enc = SaplingNoteEncryption::new(ovk, note, to, Memo::default(), &mut rng);
@@ -363,7 +363,7 @@ fn parse_note_plaintext_without_memo(
         .mul(ivk.to_repr(), &JUBJUB);
 
     let to = PaymentAddress::from_parts(diversifier, pk_d)?;
-    let note = to.create_note(v, rcm, &JUBJUB).unwrap();
+    let note = to.create_note(v, rcm, &JUBJUB, Zip212Enabled::BeforeZip212).unwrap();
 
     if note.cm(&JUBJUB) != *cmu {
         // Published commitment doesn't match calculated commitment
@@ -527,7 +527,7 @@ pub fn try_sapling_output_recovery(
     }
 
     let to = PaymentAddress::from_parts(diversifier, pk_d)?;
-    let note = to.create_note(v, rcm, &JUBJUB).unwrap();
+    let note = to.create_note(v, rcm, &JUBJUB, Zip212Enabled::BeforeZip212).unwrap();
 
     if note.cm(&JUBJUB) != *cmu {
         // Published commitment doesn't match calculated commitment
@@ -545,7 +545,7 @@ mod tests {
             fs::{Fs, FsRepr},
             PrimeOrder, Unknown,
         },
-        primitives::{Diversifier, PaymentAddress, ValueCommitment},
+        primitives::{Diversifier, PaymentAddress, ValueCommitment, Zip212Enabled},
     };
     use crypto_api_chachapoly::ChachaPolyIetf;
     use ff::{Field, PrimeField};
@@ -741,7 +741,7 @@ mod tests {
         let cv = value_commitment.cm(&JUBJUB).into();
 
         let note = pa
-            .create_note(value, Fs::random(&mut rng), &JUBJUB)
+            .create_note(value, Fs::random(&mut rng), &JUBJUB, Zip212Enabled::BeforeZip212)
             .unwrap();
         let cmu = note.cm(&JUBJUB);
 
@@ -1337,7 +1337,7 @@ mod tests {
             assert_eq!(ock.as_bytes(), tv.ock);
 
             let to = PaymentAddress::from_parts(Diversifier(tv.default_d), pk_d).unwrap();
-            let note = to.create_note(tv.v, rcm, &JUBJUB).unwrap();
+            let note = to.create_note(tv.v, rcm, &JUBJUB, Zip212Enabled::BeforeZip212).unwrap();
             assert_eq!(note.cm(&JUBJUB), cmu);
 
             //

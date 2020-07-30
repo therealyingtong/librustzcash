@@ -190,7 +190,7 @@ mod tests {
         jubjub::{fs::Fs, FixedGenerators, JubjubParams, ToUniform},
         merkle_tree::CommitmentTree,
         note_encryption::{Memo, SaplingNoteEncryption},
-        primitives::Note,
+        primitives::{Note, Zip212Enabled},
         transaction::components::Amount,
         zip32::{ExtendedFullViewingKey, ExtendedSpendingKey},
         JUBJUB,
@@ -254,6 +254,7 @@ mod tests {
             pk_d: to.pk_d().clone(),
             value: value.into(),
             r: Fs::random(&mut rng),
+            zip_212_enabled: Zip212Enabled::BeforeZip212,
         };
         let encryptor = SaplingNoteEncryption::new(
             extfvk.fvk.ovk,

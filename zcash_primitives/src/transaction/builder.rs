@@ -3,7 +3,7 @@
 use crate::zip32::ExtendedSpendingKey;
 use crate::{
     jubjub::fs::Fs,
-    primitives::{Diversifier, Note, PaymentAddress},
+    primitives::{Diversifier, Note, PaymentAddress, Zip212Enabled},
 };
 use ff::Field;
 use pairing::bls12_381::{Bls12, Fr};
@@ -108,6 +108,7 @@ impl SaplingOutput {
             pk_d: to.pk_d().clone(),
             value: value.into(),
             r: rcm,
+            zip_212_enabled: Zip212Enabled::BeforeZip212,
         };
 
         Ok(SaplingOutput {
@@ -617,6 +618,7 @@ impl<R: RngCore + CryptoRng> Builder<R> {
                             pk_d,
                             r: Fs::random(&mut self.rng),
                             value: 0,
+                            zip_212_enabled: Zip212Enabled::BeforeZip212,
                         },
                     )
                 };
@@ -709,6 +711,7 @@ mod tests {
         transaction::components::Amount,
         zip32::{ExtendedFullViewingKey, ExtendedSpendingKey},
         JUBJUB,
+        primitives::Zip212Enabled,
     };
 
     #[test]
@@ -765,7 +768,7 @@ mod tests {
         let mut rng = OsRng;
 
         let note1 = to
-            .create_note(50000, Fs::random(&mut rng), &JUBJUB)
+            .create_note(50000, Fs::random(&mut rng), &JUBJUB, Zip212Enabled::BeforeZip212)
             .unwrap();
         let cm1 = Node::new(note1.cm(&JUBJUB).to_repr());
         let mut tree = CommitmentTree::new();
@@ -864,7 +867,7 @@ mod tests {
         }
 
         let note1 = to
-            .create_note(59999, Fs::random(&mut rng), &JUBJUB)
+            .create_note(59999, Fs::random(&mut rng), &JUBJUB, Zip212Enabled::BeforeZip212)
             .unwrap();
         let cm1 = Node::new(note1.cm(&JUBJUB).to_repr());
         let mut tree = CommitmentTree::new();
@@ -903,7 +906,7 @@ mod tests {
             );
         }
 
-        let note2 = to.create_note(1, Fs::random(&mut rng), &JUBJUB).unwrap();
+        let note2 = to.create_note(1, Fs::random(&mut rng), &JUBJUB, Zip212Enabled::BeforeZip212).unwrap();
         let cm2 = Node::new(note2.cm(&JUBJUB).to_repr());
         tree.append(cm2).unwrap();
         witness1.append(cm2).unwrap();
