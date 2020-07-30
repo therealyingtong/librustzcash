@@ -31,6 +31,20 @@ pub fn prf_expand_vec(sk: &[u8], ts: &[&[u8]]) -> Blake2bHash {
     h.finalize()
 }
 
+/// Sapling PRF^rcm
+fn prf_rcm<E: JubjubEngine>(
+    rseed: [u8; 32]
+) -> E::Fs {
+    E::Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes())
+}
+
+/// Sapling PRF^esk
+fn prf_esk<E: JubjubEngine>(
+    rseed: [u8; 32]
+) -> E::Fs {
+    E::Fs::to_uniform(prf_expand(&rseed, &[0x05]).as_bytes())
+}
+
 /// An outgoing viewing key
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutgoingViewingKey(pub [u8; 32]);
