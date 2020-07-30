@@ -17,7 +17,7 @@ use crate::{
     keys::OutgoingViewingKey,
     legacy::TransparentAddress,
     merkle_tree::MerklePath,
-    note_encryption::{generate_esk, Memo, SaplingNoteEncryption},
+    note_encryption::{generate_esk_v1, generate_esk_v2, Memo, SaplingNoteEncryption},
     prover::TxProver,
     redjubjub::PrivateKey,
     sapling::{spend_sig, Node},
@@ -133,7 +133,7 @@ impl SaplingOutput {
             self.note.clone(),
             self.to.clone(),
             self.memo,
-            generate_esk(rng),
+            generate_esk_v1(rng),
         );
 
         let (zkproof, cv) = prover.output_proof(
@@ -636,7 +636,7 @@ impl<R: RngCore + CryptoRng> Builder<R> {
                     )
                 };
 
-                let esk = generate_esk(&mut self.rng);
+                let esk = generate_esk_v1(&mut self.rng);
                 let epk = dummy_note.g_d.mul(esk, &JUBJUB);
 
                 let (zkproof, cv) =

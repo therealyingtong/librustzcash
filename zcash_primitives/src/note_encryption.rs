@@ -20,7 +20,10 @@ use std::convert::TryInto;
 use std::fmt;
 use std::str;
 
-use crate::{keys::OutgoingViewingKey, JUBJUB};
+use crate::{
+    keys::{prf_expand, OutgoingViewingKey}, 
+    JUBJUB
+};
 
 pub const KDF_SAPLING_PERSONALIZATION: &[u8; 16] = b"Zcash_SaplingKDF";
 pub const PRF_OCK_PERSONALIZATION: &[u8; 16] = b"Zcash_Derive_ock";
@@ -135,13 +138,17 @@ impl str::FromStr for Memo {
     }
 }
 
-pub fn generate_esk<R: RngCore + CryptoRng>(rng: &mut R) -> Fs {
+pub fn generate_esk_v1<R: RngCore + CryptoRng>(rng: &mut R) -> Fs {
     // create random 64 byte buffer
     let mut buffer = [0u8; 64];
     rng.fill_bytes(&mut buffer);
 
     // reduce to uniform value
     Fs::to_uniform(&buffer[..])
+}
+
+pub fn generate_esk_v2(rseed: [u8; 32]) -> Fs {
+    Fs::to_uniform(prf_expand(&rseed, &[0x05]).as_bytes())
 }
 
 /// Sapling key agreement for note encryption.
