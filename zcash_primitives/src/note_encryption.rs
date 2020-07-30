@@ -138,11 +138,14 @@ impl str::FromStr for Memo {
     }
 }
 
-pub fn generate_esk_v1<R: RngCore + CryptoRng>(rng: &mut R) -> Fs {
-    // create random 64 byte buffer
-    let mut buffer = [0u8; 64];
-    rng.fill_bytes(&mut buffer);
+pub fn generate_esk(randomness: [u8], zip_212_enabled: Zip212Enabled) {
+    match zip_212_enabled {
+        BeforeZip212 => generate_esk_v1(randomness.try_into()),
+        AfterZip212 => generate_esk_v2(&randomness),
+    }
+}
 
+pub fn generate_esk_v1(buffer: [u8; 64]) -> Fs {
     // reduce to uniform value
     Fs::to_uniform(&buffer[..])
 }

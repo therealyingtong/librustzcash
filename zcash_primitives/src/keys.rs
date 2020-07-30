@@ -33,9 +33,13 @@ pub fn prf_expand_vec(sk: &[u8], ts: &[&[u8]]) -> Blake2bHash {
 
 /// Sapling PRF^rcm
 fn prf_rcm<E: JubjubEngine>(
-    rseed: [u8; 32]
+    rseed: [u8; 32],
+    zip_212_enabled: Zip212Enabled,
 ) -> E::Fs {
-    E::Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes())
+    match zip_212_enabled {
+        BeforeZip212 => E::Fs::from_repr(Fs::FsRepr(rseed)).unwrap(),
+        AfterZip212 => E::Fs::to_uniform(prf_expand(&rseed, &[0x04]).as_bytes())
+    }
 }
 
 /// Sapling PRF^esk

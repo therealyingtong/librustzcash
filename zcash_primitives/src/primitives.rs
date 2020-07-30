@@ -207,13 +207,13 @@ impl<E: JubjubEngine> PaymentAddress<E> {
     pub fn create_note(
         &self,
         value: u64,
-        randomness: E::Fs,
+        rseed: [u8; 32],
         params: &E::Params,
         zip_212_enabled: Zip212Enabled
     ) -> Option<Note<E>> {
         self.g_d(params).map(|g_d| Note {
             value,
-            r: randomness,
+            rseed,
             g_d,
             pk_d: self.pk_d.clone(),
             zip_212_enabled
@@ -235,8 +235,8 @@ pub struct Note<E: JubjubEngine> {
     pub g_d: edwards::Point<E, PrimeOrder>,
     /// The public key of the address, g_d^ivk
     pub pk_d: edwards::Point<E, PrimeOrder>,
-    /// The commitment randomness
-    pub r: E::Fs,
+    /// The commitment rseed
+    pub rseed: [u8; 32],
     /// Whether ZIP212 is enabled
     pub zip_212_enabled: Zip212Enabled,
 }
